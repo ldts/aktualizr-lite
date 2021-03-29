@@ -10,7 +10,7 @@ class DeviceGatewayMock {
         url_{"http://localhost:" + port_},
         req_headers_file_{tuf_.getPath() + "/headers.json"},
         process_{RunCmd,           "--port",         port_, "--ostree", ostree_.getPath(), "--tuf-repo", tuf_.getPath(),
-    "--headers-file", req_headers_file_}
+          "--headers-file", req_headers_file_}
   {
     TestUtils::waitForServer(url_ + "/");
     LOG_INFO << "Device Gateway is running on port " << port_;
@@ -23,6 +23,8 @@ class DeviceGatewayMock {
 
  public:
   std::string getOsTreeUri() const { return url_ + "/treehub"; }
+  std::string getAuthUri() const { return url_ + "/hub-creds"; }
+  std::string getBaseUri() const { return url_ ; }
   std::string getTufRepoUri() const { return url_ + "/repo"; }
   const std::string& getPort() const { return port_; }
   Json::Value getReqHeaders() const { return Utils::parseJSONFile(req_headers_file_); }

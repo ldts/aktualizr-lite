@@ -31,17 +31,14 @@ ComposeAppManager::Config::Config(const PackageConfig& pconfig) {
   if (raw.count("docker_compose_bin") == 1) {
     compose_bin = raw.at("docker_compose_bin");
   }
-
   if (raw.count("docker_bin") == 1) {
     docker_bin = raw.at("docker_bin");
   }
-
   if (raw.count("docker_prune") == 1) {
     std::string val = raw.at("docker_prune");
     boost::algorithm::to_lower(val);
     docker_prune = val != "0" && val != "false";
   }
-
   if (raw.count("force_update") > 0) {
     force_update = boost::lexical_cast<bool>(raw.at("force_update"));
   }
@@ -58,7 +55,7 @@ ComposeAppManager::ComposeAppManager(const PackageConfig& pconfig, const Bootloa
   if (!app_engine_) {
     app_engine_ = std::make_shared<Docker::ComposeAppEngine>(
         cfg_.apps_root, boost::filesystem::canonical(cfg_.compose_bin).string() + " ",
-        boost::filesystem::canonical(cfg_.docker_bin).string() + " ",
+        nullptr,
         std::make_shared<Docker::RegistryClient>(pconfig.ostree_server, http));
   }
 

@@ -6,7 +6,13 @@
 
 namespace Docker {
 
-class DockerClient {
+class DockerClientIF {
+ public:
+  DockerClientIF() { }
+  bool serviceRunning(std::string& service, std::string& hash) { return true; }
+};
+
+class DockerClient : public DockerClientIF {
  public:
   DockerClient(const std::string& app, bool curl = false);
   bool serviceRunning(std::string& service, std::string& hash);

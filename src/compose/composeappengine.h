@@ -7,6 +7,7 @@
 
 #include "appengine.h"
 #include "docker.h"
+#include "dockerclient.h"
 
 namespace Docker {
 
@@ -17,7 +18,7 @@ class ComposeAppEngine : public AppEngine {
   static constexpr const char* const ComposeFile{"docker-compose.yml"};
 
  public:
-  ComposeAppEngine(boost::filesystem::path root_dir, std::string compose_bin, std::string docker_bin,
+  ComposeAppEngine(boost::filesystem::path root_dir, std::string compose_bin, Docker::DockerClientIF *docker_client,
                    Docker::RegistryClient::Ptr registry_client);
 
   bool fetch(const App& app) override;
@@ -37,7 +38,7 @@ class ComposeAppEngine : public AppEngine {
  private:
   const boost::filesystem::path root_;
   const std::string compose_;
-  const std::string docker_;
+  Docker::DockerClientIF *docker_;
   Docker::RegistryClient::Ptr registry_client_;
 };
 

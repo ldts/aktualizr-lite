@@ -1,53 +1,36 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-
 #include <boost/filesystem.hpp>
 #include <boost/process.hpp>
 #include <boost/process/env.hpp>
-
-#include "libaktualizr/types.h"
-#include "logging/logging.h"
-#include "test_utils.h"
-#include "uptane_generator/image_repo.h"
-#include "utilities/utils.h"
-
-#include "composeappmanager.h"
-#include "liteclient.h"
-
 #include <iostream>
 #include <string>
 
+#include "composeappengine.h"
+#include "composeappmanager.h"
 #include "helpers.h"
+#include "http/httpclient.h"
+#include "http/httpinterface.h"
+#include "libaktualizr/types.h"
+#include "liteclient.h"
+#include "logging/logging.h"
 #include "ostree/repo.h"
+#include "storage/invstorage.h"
+#include "test_utils.h"
+#include "uptane/fetcher.h"
+#include "uptane_generator/image_repo.h"
+#include "utilities/utils.h"
 
 using ::testing::NiceMock;
 using ::testing::Return;
 
-static std::string executeCmd(const std::string& cmd, const std::vector<std::string>& args, const std::string& desc) {
-  auto res = Process::spawn(cmd, args);
-  if (std::get<0>(res) != 0) throw std::runtime_error("Failed to " + desc + ": " + std::get<2>(res));
-
-  auto std_out = std::get<1>(res);
-  boost::trim_right_if(std_out, boost::is_any_of(" \t\r\n"));
-  return std_out;
-}
-
-#include "mocks/appengine.cc"
-#include "mocks/sysrootfs.cc"
-#include "mocks/ostreerepo.cc"
-#include "mocks/sysostreerepo.cc"
-#include "mocks/tufrepo.cc"
-#include "mocks/devicegateway.cc"
-/**
- * Class LiteClientTest
- *
- */
 #include "liteclienttest.cc"
 
 /*----------------------------------------------------------------------------*/
 /*  TESTS                                                                     */
 /*                                                                            */
 /*----------------------------------------------------------------------------*/
+#if 0
 TEST_F(LiteClientTest, OstreeUpdateWhenNoInstalledVersions) {
   // boot device with no installed versions
   auto client = createLiteClient(InitialVersion::kOff);
@@ -327,6 +310,24 @@ TEST_F(LiteClientTest, AppUpdateInstallFailure) {
              data::ResultCode::Numeric::kInstallFailed);
 }
 
+#else
+TEST_F(LiteClientTest, AppUpdate) {
+  // boot device
+  auto client = createLiteClient();
+  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
+  const AppEngine::App app = createApp("app-01");
+  // Create a new Target
+  std::vector<AppEngine::App> apps;
+  apps.push_back(app);
+  auto new_target = createAppTarget(apps);
+  std::shared_ptr<Docker::ComposeAppEngine> app_engine = getAppEngine();
+  // the app docker-file.yaml was created during createApp.
+  // running just checks there is at least one service
+  ASSERT_TRUE(app_engine->isRunning(app));
+  updateApps(*client, getInitialTarget(), new_target);
+}
+#endif
+
 /*
  * main
  */
@@ -342,5 +343,7 @@ int main(int argc, char** argv) {
   // options passed as args in CMakeLists.txt
   DeviceGatewayMock::RunCmd = argv[1];
   SysRootFS::CreateCmd = argv[2];
+
+
   return RUN_ALL_TESTS();
 }
