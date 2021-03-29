@@ -84,7 +84,7 @@ add_aktualizr_test(NAME liteclient
 )
 
 target_compile_definitions(t_liteclient PRIVATE ${TEST_DEFS})
-target_include_directories(t_liteclient PRIVATE ${TEST_INCS} ${AKTUALIZR_DIR}/tests/ ${AKTUALIZR_DIR}/src/)
+target_include_directories(t_liteclient PRIVATE ${TEST_INCS} ./liteclient ${AKTUALIZR_DIR}/tests/ ${AKTUALIZR_DIR}/src/)
 target_link_libraries(t_liteclient ${TEST_LIBS} uptane_generator_lib testutilities)
 add_dependencies(t_liteclient make_ostree_sysroot)
 set_tests_properties(test_liteclient PROPERTIES LABELS "aklite:liteclient")
