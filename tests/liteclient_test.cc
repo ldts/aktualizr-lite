@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <boost/filesystem.hpp>
+#include <boost/format.hpp>
 #include <boost/process.hpp>
 #include <boost/process/env.hpp>
 
@@ -182,14 +183,15 @@ class DeviceGatewayMock {
   static std::string RunCmd;
 
  public:
-  DeviceGatewayMock(const OSTreeRepoMock& ostree, const TufRepoMock& tuf)
+  DeviceGatewayMock(const OSTreeRepoMock& ostree, const TufRepoMock& tuf, std::string certDir)
       : ostree_{ostree},
         tuf_{tuf},
         port_{TestUtils::getFreePort()},
-        url_{"http://localhost:" + port_},
+        url_{"https://localhost:" + port_},
         req_headers_file_{tuf_.getPath() + "/headers.json"},
-        process_{RunCmd,           "--port",         port_, "--ostree", ostree_.getPath(), "--tuf-repo", tuf_.getPath(),
-                 "--headers-file", req_headers_file_} {
+        process_{
+            RunCmd, "--port", port_,"--ostree", ostree_.getPath(), "--tuf-repo", tuf_.getPath(),
+            "--headers-file", req_headers_file_, "--mtls", certDir} {
     TestUtils::waitForServer(url_ + "/");
     LOG_INFO << "Device Gateway is running on port " << port_;
   }
@@ -200,6 +202,7 @@ class DeviceGatewayMock {
   }
 
  public:
+  std::string getTreeUri() const { return url_ ; }
   std::string getOsTreeUri() const { return url_ + "/treehub"; }
   std::string getTufRepoUri() const { return url_ + "/repo"; }
   const std::string& getPort() const { return port_; }
@@ -216,6 +219,252 @@ class DeviceGatewayMock {
 
 std::string DeviceGatewayMock::RunCmd;
 
+class RootCaPKI {
+ public:
+  RootCaPKI(std::string path, std::string key, std::string crt)
+      : path_(std::move(path)), key_(path_ + std::move(key)), crt_(path_ + std::move(crt)) {
+    try {
+      boost::format generatePrivateKey("openssl genrsa -out %s 4096");
+      cmd = boost::str(generatePrivateKey % key_);
+      if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+        throw std::runtime_error(cmd.c_str());
+      }
+
+      boost::format generateCrt(
+          "openssl req -new -key %s -subj \"/C=SP/ST=MALAGA/CN=ROOTCA\" -x509 -days 1000 -out %s");
+      cmd = boost::str(generateCrt % key_ % crt_);
+      if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+        throw std::runtime_error(cmd.c_str());
+      }
+    } catch (...) {
+      LOG_INFO << "Cant create CA";
+    }
+  }
+
+  void signCsr(std::string csr, std::string crt, std::string extra) {
+    boost::format doSign("openssl x509 -req -days 1000 -sha256 %s -in %s -CA %s -CAkey %s -CAcreateserial -out %s");
+    cmd = boost::str(doSign % extra % csr % crt_ % key_ % crt);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+  }
+
+ private:
+  std::string path_;
+  std::string key_;
+  std::string crt_;
+  std::string cnf_;
+  /* buffers */
+  std::string cmd;
+  std::string out;
+};
+
+class ServerPKI {
+ public:
+  ServerPKI(std::string path, RootCaPKI& rootCa) {
+    /* hardcoded names as required by the http server */
+    std::string csr = path + "/server.csr";
+    std::string crt = path + "/server.crt";
+    std::string key = path + "/pkey.pem";
+    std::string xtr = path + "/altname.txt";
+
+    boost::format generatePrivateKey("openssl genrsa -out %s 2048");
+    cmd = boost::str(generatePrivateKey % key);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+
+    boost::format generateCsr("openssl req -new -sha256 -key %s -subj \"/C=SP/ST=MALAGA/CN=localhost\" -out %s");
+    cmd = boost::str(generateCsr % key % csr);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+    std::string info = "subjectAltName = DNS:localhost\n";
+    Utils::writeFile(xtr, info, false);
+    rootCa.signCsr(csr, crt, "-extfile " + xtr);
+  }
+
+ private:
+  std::string cmd;
+  std::string out;
+};
+
+class Hsm {
+ public:
+  Hsm(std::string path)
+      : label_("aktualizr"),
+        pin_("87654321"),
+        path_(std::move(path)),
+        module_("/usr/lib/softhsm/libsofthsm2.so"),
+        sopin_("12345678"),
+        conf_(path_ + "/softhsm2.conf") {
+    /* prepare softhsm2 work area */
+    std::ofstream cfgOut(conf_);
+    cfgOut << "directories.tokendir = " << path_ << std::endl;
+    cfgOut << "log.level = DEBUG\n";
+    cfgOut << "slots.removable = false\n";
+    cfgOut << "slots.mechanisms = ALL\n";
+    cfgOut.close();
+
+    boost::format initToken("SOFTHSM2_CONF=%s softhsm2-util --init-token --label %s --so-pin %s --pin %s --free");
+    cmd = boost::str(initToken % conf_ % label_ % sopin_ % pin_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+    LOG_INFO << "HSM initialized";
+  };
+
+ public:
+  std::string label_;
+  std::string pin_;
+  std::string path_;
+  std::string module_;
+  std::string conf_;
+
+ private:
+  std::string sopin_;
+  /* buffers */
+  std::string cmd;
+  std::string out;
+};
+
+class DeviceHsm {
+ public:
+  DeviceHsm(Hsm& hsm, RootCaPKI& rootCa) : hsm_(hsm), rootCa_(rootCa), cnf_(hsm_.path_ + "/device.cnf") {
+    std::ofstream cnfOut(cnf_);
+    cnfOut << "openssl_conf = oc\n";
+    cnfOut << "[oc]\n";
+    cnfOut << "engines = eng\n";
+    cnfOut << "[eng]\n";
+    cnfOut << "pkcs11 = p11\n";
+    cnfOut << "[p11]\n";
+    cnfOut << "engine_id = pkcs11\n";
+    cnfOut << "dynamic_path = /usr/lib/x86_64-linux-gnu/engines-1.1/pkcs11.so\n";
+    cnfOut << "MODULE_PATH = " << hsm_.module_ << std::endl;
+    cnfOut << "init = 0\n";
+    cnfOut << "PIN = " << hsm_.pin_ << std::endl;
+    cnfOut << "[req]\n";
+    cnfOut << "prompt = no\n";
+    cnfOut << "distinguished_name = dn\n";
+    cnfOut << "req_extensions = ext\n";
+    cnfOut << "[dn]\n";
+    cnfOut << "C = SP\n";
+    cnfOut << "ST = MALAGA\n";
+    cnfOut << "CN = DeviceHSM\n";
+    cnfOut << "OU = Factory\n";
+    cnfOut << "[ext]\n";
+    cnfOut << "keyUsage = critical, digitalSignature\n";
+    cnfOut << "extendedKeyUsage = critical, clientAuth\n";
+    cnfOut.close();
+  }
+
+  void createKey(std::string id, std::string label) {
+    boost::format generateKeyPair(
+        "SOFTHSM2_CONF=%s pkcs11-tool --module %s --keypairgen --key-type EC:prime256v1 --token-label %s --id %s "
+        "--label %s --pin %s");
+    cmd = boost::str(generateKeyPair % hsm_.conf_ % hsm_.module_ % hsm_.label_ % id % label % hsm_.pin_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+  }
+
+  void createCsr(std::string label, std::string& csr) {
+    boost::format keyFmt("\"pkcs11:token=%s;object=%s;type=private;pin-value=%s\"");
+    std::string key = boost::str(keyFmt % hsm_.label_ % label % hsm_.pin_);
+
+    boost::format doCsr("SOFTHSM2_CONF=%s OPENSSL_CONF=%s openssl req -new -engine pkcs11 -keyform engine -key %s");
+    cmd = boost::str(doCsr % hsm_.conf_ % cnf_ % key);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+
+    /* write CSR to disk */
+    csr = hsm_.path_ + csr;
+    Utils::writeFile(csr, out, true);
+  }
+
+  void createCrt(std::string csr, std::string& crt) {
+    crt = hsm_.path_ + crt;
+    rootCa_.signCsr(csr, crt, "");
+  }
+
+  void importCrt(std::string& crt, std::string id) {
+    boost::format crtToDer("SOFTHSM2_CONF=%s OPENSSL_CONF=%s openssl x509 -inform pem -in %s -out %s/tmp.der");
+    cmd = boost::str(crtToDer % hsm_.conf_ % cnf_ % crt % hsm_.path_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+
+    boost::format writeCrtToHsm(
+        "SOFTHSM2_CONF=%s pkcs11-tool --module %s -w %s/tmp.der -y cert --id %s --pin %s");
+    cmd = boost::str(writeCrtToHsm % hsm_.conf_ % hsm_.module_ % hsm_.path_ % id % hsm_.pin_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+    LOG_INFO << out;
+  }
+
+  void listInfo() {
+    boost::format listMechanisms("SOFTHSM2_CONF=%s pkcs11-tool --module %s --list-mechanisms");
+    cmd = boost::str(listMechanisms % hsm_.conf_ % hsm_.module_ );
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+    /* very verbose */
+    LOG_INFO << out;
+    boost::format listObjects("SOFTHSM2_CONF=%s pkcs11-tool --module %s --list-objects");
+    cmd = boost::str(listObjects % hsm_.conf_ % hsm_.module_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+     throw std::runtime_error(cmd.c_str());
+    }
+    /* very verbose */
+    LOG_INFO << out;
+  }
+
+ private:
+  Hsm& hsm_;
+  RootCaPKI& rootCa_;
+  std::string cnf_;
+  /* buffers */
+  std::string cmd;
+  std::string out;
+};
+
+class SubscriberPKI {
+ public:
+  SubscriberPKI(DeviceHsm& deviceHsm, std::string keyId, std::string certId, std::string keyLabel)
+      : keyId_(std::move(keyId)),
+        certId_(std::move(certId)),
+        keyLabel_(std::move(keyLabel)),
+        csr_("/device.csr"),
+        crt_("/device.crt") {
+    deviceHsm.createKey(keyId_, keyLabel_);
+    deviceHsm.createCsr(keyLabel_, csr_);
+    deviceHsm.createCrt(csr_, crt_);
+    deviceHsm.importCrt(crt_, certId_);
+    /* enable for debug */
+    deviceHsm.listInfo();
+  }
+
+ public:
+  std::string keyId_;
+  std::string certId_;
+
+ private:
+  std::string keyLabel_;
+  std::string csr_;
+  std::string crt_;
+};
+
 /**
  * Class LiteClientTest
  *
@@ -230,7 +479,12 @@ class LiteClientTest : public ::testing::Test {
         sys_repo_{(test_dir_.Path() / "sysrepo").string(), os},
         tuf_repo_{test_dir_.Path() / "repo"},
         ostree_repo_{(test_dir_.Path() / "treehub").string(), true},
-        device_gateway_{ostree_repo_, tuf_repo_},
+        root_ca_{test_dir_.Path().string(), "/ca.key", "/ca.crt"},
+        hsm_{test_dir_.Path().string()},
+        device_hsm_{hsm_, root_ca_},
+        subscriber_{device_hsm_, "01", "03", "tls"},
+        server_{test_dir_.Path().string(), root_ca_},
+        device_gateway_{ostree_repo_, tuf_repo_, test_dir_.Path().string()},
         initial_target_{Uptane::Target::Unknown()},
         sysroot_hash_{sys_repo_.getRepo().commit(sys_rootfs_.path, sys_rootfs_.branch)} {
     sys_repo_.deploy(sysroot_hash_);
@@ -244,6 +498,20 @@ class LiteClientTest : public ::testing::Test {
   std::shared_ptr<LiteClient> createLiteClient(InitialVersion initial_version = InitialVersion::kOn,
                                                boost::optional<std::vector<std::string>> apps = boost::none) {
     Config conf;
+    conf.tls.pkey_source = CryptoSource::kPkcs11;
+    conf.tls.cert_source = CryptoSource::kPkcs11;
+    conf.tls.ca_source = CryptoSource::kFile;
+    conf.tls.server = device_gateway_.getTreeUri();
+
+    conf.p11.tls_clientcert_id = subscriber_.certId_;
+    conf.p11.tls_pkey_id = subscriber_.keyId_;
+    conf.p11.module = hsm_.module_;
+    conf.p11.pass = hsm_.pin_;
+
+    utils::BasedPath tls_cacert_path{"ca.crt"};
+    conf.import.base_path = test_dir_.Path();
+    conf.import.tls_cacert_path = tls_cacert_path;
+
     conf.uptane.repo_server = device_gateway_.getTufRepoUri();
     conf.provision.primary_ecu_hardware_id = hw_id;
     conf.storage.path = test_dir_.Path();
@@ -261,7 +529,6 @@ class LiteClientTest : public ::testing::Test {
 
     conf.bootloader.reboot_command = "/bin/true";
     conf.bootloader.reboot_sentinel_dir = conf.storage.path;
-    conf.import.base_path = test_dir_ / "import";
 
     if (initial_version == InitialVersion::kOn || initial_version == InitialVersion::kCorrupted1 ||
         initial_version == InitialVersion::kCorrupted2) {
@@ -332,6 +599,7 @@ class LiteClientTest : public ::testing::Test {
 
       getTufRepo().addTarget(initial_target_.filename(), initial_target_.sha256Hash(), hw_id, "1");
     }
+
     app_engine_ = std::make_shared<NiceMock<MockAppEngine>>();
     return std::make_shared<LiteClient>(conf, app_engine_);
   }
@@ -534,6 +802,11 @@ class LiteClientTest : public ::testing::Test {
   SysOSTreeRepoMock sys_repo_;
   TufRepoMock tuf_repo_;
   OSTreeRepoMock ostree_repo_;
+  RootCaPKI root_ca_;
+  Hsm hsm_;
+  DeviceHsm device_hsm_;
+  SubscriberPKI subscriber_;
+  ServerPKI server_;
   DeviceGatewayMock device_gateway_;
   Uptane::Target initial_target_;
   const std::string sysroot_hash_;
