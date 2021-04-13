@@ -18,6 +18,9 @@ class Handler(SimpleHTTPRequestHandler):
     AuthPrefix = "/hub-creds/"
     RegistryAuthPrefix = "/token-auth/"
     RegistryPrefix = "/v2/"
+    def do_POST(self):
+        self.send_response(200)
+        self.end_headers()
 
     def do_GET(self):
         if self.path.startswith(self.TufRepoPrefix):
