@@ -104,4 +104,5 @@ add_dependencies(t_liteclientHSM make_ostree_sysroot)
 set_tests_properties(test_liteclientHSM PROPERTIES LABELS "aklite:liteclientHSM")
 
 aktualizr_source_file_checks(liteclient_test.cc)
+aktualizr_source_file_checks(liteclientHSM_test.cc)
 

@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <boost/filesystem.hpp>
+#include <boost/format.hpp>
 #include <boost/process.hpp>
 #include <boost/process/env.hpp>
 
@@ -182,15 +183,16 @@ class DeviceGatewayMock {
   static std::string RunCmd;
 
  public:
-  DeviceGatewayMock(const OSTreeRepoMock& ostree, const TufRepoMock& tuf)
+  DeviceGatewayMock(const OSTreeRepoMock& ostree, const TufRepoMock& tuf, std::string certDir)
       : ostree_{ostree},
         tuf_{tuf},
         port_{TestUtils::getFreePort()},
-        url_{"http://localhost:" + port_},
+        url_{"https://localhost:" + port_},
         req_headers_file_{tuf_.getPath() + "/headers.json"},
-        process_{RunCmd,           "--port",         port_, "--ostree", ostree_.getPath(), "--tuf-repo", tuf_.getPath(),
-                 "--headers-file", req_headers_file_} {
-    TestUtils::waitForServer(url_ + "/");
+        process_{
+            RunCmd,           "--port",          port_,    "--ostree", ostree_.getPath(), "--tuf-repo", tuf_.getPath(),
+            "--headers-file", req_headers_file_, "--mtls", certDir} {
+    sleep(1);
     LOG_INFO << "Device Gateway is running on port " << port_;
   }
 
@@ -200,6 +202,7 @@ class DeviceGatewayMock {
   }
 
  public:
+  std::string getTreeUri() const { return url_; }
   std::string getOsTreeUri() const { return url_ + "/treehub"; }
   std::string getTufRepoUri() const { return url_ + "/repo"; }
   const std::string& getPort() const { return port_; }
@@ -216,21 +219,281 @@ class DeviceGatewayMock {
 
 std::string DeviceGatewayMock::RunCmd;
 
+class RootCaPKI {
+ public:
+  RootCaPKI(std::string path, std::string key, std::string crt)
+      : key_(path + std::move(key)), crt_(path + std::move(crt)) {
+    try {
+      boost::format generatePrivateKey("openssl genrsa -out %s 4096");
+      cmd = boost::str(generatePrivateKey % key_);
+      if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+        throw std::runtime_error(cmd.c_str());
+      }
+
+      boost::format generateCrt(
+          "openssl req -new -key %s -subj \"/C=SP/ST=MALAGA/CN=ROOTCA\" -x509 -days 1000 -out %s");
+      cmd = boost::str(generateCrt % key_ % crt_);
+      if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+        throw std::runtime_error(cmd.c_str());
+      }
+    } catch (...) {
+      LOG_INFO << "Cant create CA";
+    }
+  }
+
+  void signCsr(std::string csr, std::string crt, std::string extra) {
+    boost::format doSign("openssl x509 -req -days 1000 -sha256 %s -in %s -CA %s -CAkey %s -CAcreateserial -out %s");
+    cmd = boost::str(doSign % extra % csr % crt_ % key_ % crt);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+  }
+
+ private:
+  std::string key_;
+  std::string crt_;
+  /* buffers */
+  std::string cmd;
+  std::string out;
+};
+
+class ServerPKI {
+ public:
+  ServerPKI(std::string path, RootCaPKI& rootCa, std::string csr, std::string crt, std::string key) {
+    /* hardcoded names as required by the http server */
+    csr = path + csr;
+    crt = path + crt;
+    key = path + key;
+    std::string xtr = path + "/altname.txt";
+
+    boost::format generatePrivateKey("openssl genrsa -out %s 2048");
+    cmd = boost::str(generatePrivateKey % key);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+
+    boost::format generateCsr("openssl req -new -sha256 -key %s -subj \"/C=SP/ST=MALAGA/CN=localhost\" -out %s");
+    cmd = boost::str(generateCsr % key % csr);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+    std::string info = "subjectAltName = DNS:localhost\n";
+    Utils::writeFile(xtr, info, false);
+    rootCa.signCsr(csr, crt, "-extfile " + xtr);
+  }
+
+ private:
+  std::string cmd;
+  std::string out;
+};
+
+class Hsm {
+ public:
+  Hsm(std::string path)
+      : label_("aktualizr"),
+        pin_("87654321"),
+        path_(std::move(path)),
+        module_("/usr/lib/softhsm/libsofthsm2.so"),
+        sopin_("12345678"),
+        conf_(path_ + "/softhsm2.conf") {
+    /* prepare softhsm2 work area */
+    std::ofstream cfgOut(conf_);
+    cfgOut << "directories.tokendir = " << path_ << std::endl;
+    cfgOut << "log.level = DEBUG\n";
+    cfgOut << "slots.removable = false\n";
+    cfgOut.close();
+
+    boost::format initToken("SOFTHSM2_CONF=%s softhsm2-util --init-token --free --label %s --so-pin %s --pin %s");
+    cmd = boost::str(initToken % conf_ % label_ % sopin_ % pin_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+
+    /* system level environment configuration */
+    setenv("SOFTHSM2_CONF", conf_.c_str(), 1);
+    LOG_INFO << "HSM initialized";
+  };
+
+ public:
+  std::string label_;
+  std::string pin_;
+  std::string path_;
+  std::string module_;
+  std::string conf_;
+
+ private:
+  std::string sopin_;
+  /* buffers */
+  std::string cmd;
+  std::string out;
+};
+
+class DeviceHsm {
+ public:
+  DeviceHsm(Hsm* hsm, RootCaPKI& rootCa) : hsm_(hsm), rootCa_(rootCa), cnf_(hsm_->path_ + "/device.cnf") {
+    std::ofstream cnfOut(cnf_);
+    cnfOut << "openssl_conf = oc\n";
+    cnfOut << "[oc]\n";
+    cnfOut << "engines = eng\n";
+    cnfOut << "[eng]\n";
+    cnfOut << "pkcs11 = p11\n";
+    cnfOut << "[p11]\n";
+    cnfOut << "engine_id = pkcs11\n";
+    cnfOut << "dynamic_path = /usr/lib/x86_64-linux-gnu/engines-1.1/pkcs11.so\n";
+    cnfOut << "MODULE_PATH = " << hsm_->module_ << std::endl;
+    cnfOut << "init = 0\n";
+    cnfOut << "PIN = " << hsm_->pin_ << std::endl;
+    cnfOut << "[req]\n";
+    cnfOut << "prompt = no\n";
+    cnfOut << "distinguished_name = dn\n";
+    cnfOut << "req_extensions = ext\n";
+    cnfOut << "[dn]\n";
+    cnfOut << "C = SP\n";
+    cnfOut << "ST = MALAGA\n";
+    cnfOut << "CN = DeviceHSM\n";
+    cnfOut << "OU = Factory\n";
+    cnfOut << "[ext]\n";
+    cnfOut << "keyUsage = critical, digitalSignature\n";
+    cnfOut << "extendedKeyUsage = critical, clientAuth\n";
+    cnfOut.close();
+
+  }
+
+  void createKey(std::string id, std::string label) {
+    boost::format generateKeyPair(
+        "pkcs11-tool --module %s --keypairgen --key-type EC:prime256v1 --token-label %s --id %s "
+        "--label %s --pin %s");
+    cmd = boost::str(generateKeyPair % hsm_->module_ % hsm_->label_ % id % label % hsm_->pin_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+  }
+
+  void createCsr(std::string label, std::string& csr) {
+    boost::format keyFmt("\"pkcs11:token=%s;object=%s;type=private;pin-value=%s\"");
+    std::string key = boost::str(keyFmt % hsm_->label_ % label % hsm_->pin_);
+
+    boost::format doCsr("OPENSSL_CONF=%s openssl req -new -engine pkcs11 -keyform engine -key %s");
+    cmd = boost::str(doCsr % cnf_ % key);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+
+    /* write CSR to disk */
+    csr = hsm_->path_ + csr;
+    Utils::writeFile(csr, out, true);
+  }
+
+  void createCrt(std::string csr, std::string& crt) {
+    crt = hsm_->path_ + crt;
+    rootCa_.signCsr(csr, crt, "");
+  }
+
+  void importCrt(std::string& crt, std::string id) {
+    boost::format crtToDer("OPENSSL_CONF=%s openssl x509 -inform pem -in %s -out %s/tmp.der");
+    cmd = boost::str(crtToDer % cnf_ % crt % hsm_->path_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+
+    boost::format writeCrtToHsm("pkcs11-tool --module %s -w %s/tmp.der -y cert --id %s --pin %s");
+    cmd = boost::str(writeCrtToHsm % hsm_->module_ % hsm_->path_ % id % hsm_->pin_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+  }
+
+  void listInfo() {
+    boost::format listMechanisms("pkcs11-tool --module %s --list-mechanisms");
+    cmd = boost::str(listMechanisms % hsm_->module_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      LOG_INFO << "Error: " << out;
+      throw std::runtime_error(cmd.c_str());
+    }
+    // very verbose
+    // LOG_INFO << out;
+    boost::format listObjects("pkcs11-tool --module %s --list-objects");
+    cmd = boost::str(listObjects % hsm_->module_);
+    if (Utils::shell(cmd, &out, true) != EXIT_SUCCESS) {
+      throw std::runtime_error(cmd.c_str());
+    }
+    // very verbose
+    LOG_INFO << out;
+  }
+
+ private:
+  Hsm* hsm_;
+  RootCaPKI& rootCa_;
+  std::string cnf_;
+  /* buffers */
+  std::string cmd;
+  std::string out;
+};
+
+class SubscriberPKI {
+ public:
+  SubscriberPKI(DeviceHsm deviceHsm, std::string keyId, std::string certId, std::string keyLabel, std::string csr,
+                std::string crt)
+      : keyId_(std::move(keyId)),
+        certId_(std::move(certId)),
+        keyLabel_(std::move(keyLabel)),
+        csr_{std::move(csr)},
+        crt_{std::move(crt)} {
+    deviceHsm.createKey(keyId_, keyLabel_);
+    deviceHsm.createCsr(keyLabel_, csr_);
+    deviceHsm.createCrt(csr_, crt_);
+    deviceHsm.importCrt(crt_, certId_);
+    /* enable for debug */
+    deviceHsm.listInfo();
+  }
+
+ public:
+  std::string keyId_;
+  std::string certId_;
+
+ private:
+  std::string keyLabel_;
+  std::string csr_;
+  std::string crt_;
+};
+
 /**
- * Class LiteClientTest
+ * Class LiteClientHSMTest
  *
  */
-class LiteClientTest : public ::testing::Test {
+class LiteClientHSMTest : public ::testing::Test {
  public:
   static std::string SysRootSrc;
 
  protected:
-  LiteClientTest()
+  static void SetUpTestSuite() {
+    boost::filesystem::path path = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path();
+    Utils::createDirectories(path, S_IRWXU);
+    hsm_ = new Hsm(path.string());
+    RootCaPKI ca(path.string(), "/ca.key", "/ca.crt");
+    DeviceHsm device(hsm_, ca);
+    ServerPKI server(path.string(), ca, "/server.csr", "/server.crt", "/pkey.pem");
+    subscriber_ = new SubscriberPKI(device, "01", "03", "tls", "/device.csr", "/device.crt");
+
+    LOG_INFO << "PKI created, certificates directory: " << path.string();
+  }
+
+  static void TearDownTestSuite() {}
+
+  LiteClientHSMTest()
       : sys_rootfs_{(test_dir_.Path() / "sysroot-fs").string(), branch, hw_id, os},
         sys_repo_{(test_dir_.Path() / "sysrepo").string(), os},
         tuf_repo_{test_dir_.Path() / "repo"},
         ostree_repo_{(test_dir_.Path() / "treehub").string(), true},
-        device_gateway_{ostree_repo_, tuf_repo_},
+        device_gateway_{ostree_repo_, tuf_repo_, hsm_->path_},
         initial_target_{Uptane::Target::Unknown()},
         sysroot_hash_{sys_repo_.getRepo().commit(sys_rootfs_.path, sys_rootfs_.branch)} {
     sys_repo_.deploy(sysroot_hash_);
@@ -244,9 +507,30 @@ class LiteClientTest : public ::testing::Test {
   std::shared_ptr<LiteClient> createLiteClient(InitialVersion initial_version = InitialVersion::kOn,
                                                boost::optional<std::vector<std::string>> apps = boost::none) {
     Config conf;
+    conf.tls.pkey_source = CryptoSource::kPkcs11;
+    conf.tls.cert_source = CryptoSource::kPkcs11;
+    conf.tls.ca_source = CryptoSource::kFile;
+    conf.tls.server = device_gateway_.getTreeUri();
+
+    conf.p11.tls_clientcert_id = subscriber_->certId_;
+    conf.p11.tls_pkey_id = subscriber_->keyId_;
+    conf.p11.module = {hsm_->module_.c_str()};
+    conf.p11.pass = hsm_->pin_;
+
+    conf.import.base_path = hsm_->path_;
+    conf.import.tls_cacert_path = {"ca.crt"};
+    conf.import.tls_clientcert_path = {""};
+    conf.import.tls_pkey_path = {""};
+
     conf.uptane.repo_server = device_gateway_.getTufRepoUri();
     conf.provision.primary_ecu_hardware_id = hw_id;
+    conf.provision.server = device_gateway_.getTreeUri();
+
     conf.storage.path = test_dir_.Path();
+    conf.storage.tls_cacert_path = {"ca.crt"};
+    conf.storage.sqldb_path = {"sql.db"};
+    conf.storage.tls_clientcert_path = {""};
+    conf.storage.tls_pkey_path = {""};
 
     conf.pacman.type = ComposeAppManager::Name;
     conf.pacman.sysroot = sys_repo_.getPath();
@@ -261,7 +545,6 @@ class LiteClientTest : public ::testing::Test {
 
     conf.bootloader.reboot_command = "/bin/true";
     conf.bootloader.reboot_sentinel_dir = conf.storage.path;
-    conf.import.base_path = test_dir_ / "import";
 
     if (initial_version == InitialVersion::kOn || initial_version == InitialVersion::kCorrupted1 ||
         initial_version == InitialVersion::kCorrupted2) {
@@ -332,6 +615,7 @@ class LiteClientTest : public ::testing::Test {
 
       getTufRepo().addTarget(initial_target_.filename(), initial_target_.sha256Hash(), hw_id, "1");
     }
+
     app_engine_ = std::make_shared<NiceMock<MockAppEngine>>();
     return std::make_shared<LiteClient>(conf, app_engine_);
   }
@@ -527,6 +811,8 @@ class LiteClientTest : public ::testing::Test {
   static const std::string branch;
   static const std::string hw_id;
   static const std::string os;
+  static Hsm* hsm_;
+  static SubscriberPKI* subscriber_;
 
  private:
   TemporaryDirectory test_dir_;  // must be the first element in the class
@@ -541,224 +827,19 @@ class LiteClientTest : public ::testing::Test {
   boost::optional<std::vector<std::string>> app_shortlist_;
 };
 
-std::string LiteClientTest::SysRootSrc;
-const std::string LiteClientTest::branch{"lmp"};
-const std::string LiteClientTest::hw_id{"raspberrypi4-64"};
-const std::string LiteClientTest::os{"lmp"};
+std::string LiteClientHSMTest::SysRootSrc;
+const std::string LiteClientHSMTest::branch{"lmp"};
+const std::string LiteClientHSMTest::hw_id{"raspberrypi4-64"};
+const std::string LiteClientHSMTest::os{"lmp"};
+SubscriberPKI* LiteClientHSMTest::subscriber_;
+Hsm* LiteClientHSMTest::hsm_;
 
 /*----------------------------------------------------------------------------*/
 /*  TESTS                                                                     */
 /*                                                                            */
 /*----------------------------------------------------------------------------*/
-TEST_F(LiteClientTest, OstreeUpdateWhenNoInstalledVersions) {
-  // boot device with no installed versions
-  auto client = createLiteClient(InitialVersion::kOff);
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
 
-  // Create a new Target: update rootfs and commit it into Treehub's repo
-  auto new_target = createTarget();
-  update(*client, getInitialTarget(), new_target);
-
-  // check there is still no target
-  auto req_headers = getDeviceGateway().getReqHeaders();
-  ASSERT_EQ(req_headers["x-ats-target"], Uptane::Target::Unknown().filename());
-  ASSERT_FALSE(new_target.MatchTarget(Uptane::Target::Unknown()));
-
-  // verify the install
-  ASSERT_TRUE(client->getCurrent().MatchTarget(Uptane::Target::Unknown()));
-  reboot(client);
-  ASSERT_FALSE(new_target.MatchTarget(Uptane::Target::Unknown()));
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), new_target));
-  checkHeaders(*client, new_target);
-}
-
-TEST_F(LiteClientTest, OstreeUpdateInstalledVersionsCorrupted1) {
-  // boot device with an invalid initial_version json file (ostree sha)
-  auto client = createLiteClient(InitialVersion::kCorrupted1);
-
-  // verify that the initial version was corrupted
-  ASSERT_FALSE(targetsMatch(client->getCurrent(), getInitialTarget()));
-  setInitialTarget(Uptane::Target::Unknown());
-
-  // Create a new Target: update rootfs and commit it into Treehub's repo
-  auto new_target = createTarget();
-  update(*client, getInitialTarget(), new_target);
-
-  auto req_headers = getDeviceGateway().getReqHeaders();
-  ASSERT_EQ(req_headers["x-ats-target"], Uptane::Target::Unknown().filename());
-  ASSERT_FALSE(new_target.MatchTarget(Uptane::Target::Unknown()));
-
-  // verify the install
-  ASSERT_TRUE(client->getCurrent().MatchTarget(Uptane::Target::Unknown()));
-  reboot(client);
-  ASSERT_FALSE(new_target.MatchTarget(Uptane::Target::Unknown()));
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), new_target));
-  checkHeaders(*client, new_target);
-}
-
-TEST_F(LiteClientTest, OstreeUpdateInstalledVersionsCorrupted2) {
-  // boot device with a corrupted json file in the filesystem
-  auto client = createLiteClient(InitialVersion::kCorrupted2);
-
-  // verify that the initial version was corrupted
-  ASSERT_FALSE(targetsMatch(client->getCurrent(), getInitialTarget()));
-  setInitialTarget(Uptane::Target::Unknown());
-
-  // Create a new Target: update rootfs and commit it into Treehub's repo
-  auto new_target = createTarget();
-  update(*client, getInitialTarget(), new_target);
-
-  auto req_headers = getDeviceGateway().getReqHeaders();
-  ASSERT_EQ(req_headers["x-ats-target"], Uptane::Target::Unknown().filename());
-  ASSERT_FALSE(new_target.MatchTarget(Uptane::Target::Unknown()));
-
-  // verify the install
-  ASSERT_TRUE(client->getCurrent().MatchTarget(Uptane::Target::Unknown()));
-  reboot(client);
-  ASSERT_FALSE(new_target.MatchTarget(Uptane::Target::Unknown()));
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), new_target));
-  checkHeaders(*client, new_target);
-}
-
-TEST_F(LiteClientTest, OstreeUpdate) {
-  // boot device
-  auto client = createLiteClient();
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-
-  // Create a new Target: update rootfs and commit it into Treehub's repo
-  auto new_target = createTarget();
-  update(*client, getInitialTarget(), new_target);
-
-  // reboot device
-  reboot(client);
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), new_target));
-  checkHeaders(*client, new_target);
-}
-
-TEST_F(LiteClientTest, OstreeUpdateRollback) {
-  // boot device
-  auto client = createLiteClient();
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-
-  // Create a new Target: update rootfs and commit it into Treehub's repo
-  auto new_target = createTarget();
-  update(*client, getInitialTarget(), new_target);
-
-  // deploy the initial version/commit to emulate rollback
-  getSysRepo().deploy(getInitialTarget().sha256Hash());
-
-  reboot(client);
-  // make sure that a rollback has happened and a client is still running the initial Target
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-  checkHeaders(*client, getInitialTarget());
-
-  // make sure we cannot install the bad version
-  std::vector<Uptane::Target> known_but_not_installed_versions;
-  get_known_but_not_installed_versions(*client, known_but_not_installed_versions);
-  ASSERT_TRUE(known_local_target(*client, new_target, known_but_not_installed_versions));
-
-  // make sure we can update a device with a new valid Target
-  auto new_target_03 = createTarget();
-  update(*client, getInitialTarget(), new_target_03);
-
-  reboot(client);
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), new_target_03));
-  checkHeaders(*client, new_target_03);
-}
-
-TEST_F(LiteClientTest, OstreeUpdateToLatestAfterManualUpdate) {
-  // boot device
-  auto client = createLiteClient();
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-
-  // Create a new Target: update rootfs and commit it into Treehub's repo
-  auto new_target = createTarget();
-  update(*client, getInitialTarget(), new_target);
-
-  // reboot device
-  reboot(client);
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), new_target));
-  checkHeaders(*client, new_target);
-
-  // emulate manuall update to the previous version
-  update(*client, new_target, getInitialTarget());
-
-  // reboot device and make sure that the previous version is installed
-  reboot(client);
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-  checkHeaders(*client, getInitialTarget());
-
-  // make sure we can install the latest version that has been installed before
-  // the succesfully installed Target should be "not known"
-  std::vector<Uptane::Target> known_but_not_installed_versions;
-  get_known_but_not_installed_versions(*client, known_but_not_installed_versions);
-  ASSERT_FALSE(known_local_target(*client, new_target, known_but_not_installed_versions));
-
-  // emulate auto update to the latest
-  update(*client, getInitialTarget(), new_target);
-
-  reboot(client);
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), new_target));
-  checkHeaders(*client, new_target);
-}
-
-TEST_F(LiteClientTest, AppUpdate) {
-  // boot device
-  auto client = createLiteClient();
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-
-  // Create a new Target that just adds a new an app
-  auto new_target = createAppTarget({createApp("app-01")});
-
-  // update to the latest version
-  EXPECT_CALL(*getAppEngine(), fetch).Times(1);
-
-  // since the Target/app is not installed then no reason to check if the app is running
-  EXPECT_CALL(*getAppEngine(), isRunning).Times(0);
-  EXPECT_CALL(*getAppEngine(), install).Times(0);
-
-  // just call run which includes install if necessary (no ostree update case)
-  EXPECT_CALL(*getAppEngine(), run).Times(1);
-
-  updateApps(*client, getInitialTarget(), new_target);
-}
-
-TEST_F(LiteClientTest, AppUpdateWithShortlist) {
-  // boot device
-  auto client = createLiteClient(InitialVersion::kOn, boost::make_optional(std::vector<std::string>{"app-02"}));
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-
-  // Create a new Target that adds two new apps
-  auto new_target = createAppTarget({createApp("app-01"), createApp("app-02")});
-
-  // update to the latest version
-  EXPECT_CALL(*getAppEngine(), fetch).Times(1);
-  EXPECT_CALL(*getAppEngine(), isRunning).Times(0);
-  EXPECT_CALL(*getAppEngine(), install).Times(0);
-  // run should be called once since only one app is specified in the config
-  EXPECT_CALL(*getAppEngine(), run).Times(1);
-
-  updateApps(*client, getInitialTarget(), new_target);
-}
-
-TEST_F(LiteClientTest, AppUpdateWithEmptyShortlist) {
-  // boot device
-  auto client = createLiteClient(InitialVersion::kOn, boost::make_optional(std::vector<std::string>{""}));
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-
-  // Create a new Target that adds two new apps
-  auto new_target = createAppTarget({createApp("app-01"), createApp("app-02")});
-
-  // update to the latest version, nothing should be called since an empty app list is specified in the config
-  EXPECT_CALL(*getAppEngine(), fetch).Times(0);
-  EXPECT_CALL(*getAppEngine(), isRunning).Times(0);
-  EXPECT_CALL(*getAppEngine(), install).Times(0);
-  EXPECT_CALL(*getAppEngine(), run).Times(0);
-
-  updateApps(*client, getInitialTarget(), new_target);
-}
-
-TEST_F(LiteClientTest, OstreeAndAppUpdate) {
+TEST_F(LiteClientHSMTest, OstreeAndAppUpdate) {
   // boot device
   auto client = createLiteClient();
   ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
@@ -785,91 +866,6 @@ TEST_F(LiteClientTest, OstreeAndAppUpdate) {
     reboot(client);
     ASSERT_TRUE(targetsMatch(client->getCurrent(), new_target));
     checkHeaders(*client, new_target);
-  }
-}
-
-TEST_F(LiteClientTest, AppUpdateDownloadFailure) {
-  // boot device
-  auto client = createLiteClient();
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-
-  // Create a new Target that just adds a new an app
-  auto new_target = createAppTarget({createApp("app-01")});
-
-  ON_CALL(*getAppEngine(), fetch).WillByDefault(Return(false));
-
-  // update to the latest version
-  // fetch retry for three times
-  EXPECT_CALL(*getAppEngine(), fetch).Times(3);
-  EXPECT_CALL(*getAppEngine(), isRunning).Times(0);
-  EXPECT_CALL(*getAppEngine(), install).Times(0);
-  EXPECT_CALL(*getAppEngine(), run).Times(0);
-
-  updateApps(*client, getInitialTarget(), new_target, data::ResultCode::Numeric::kDownloadFailed);
-}
-
-TEST_F(LiteClientTest, AppUpdateInstallFailure) {
-  // boot device
-  auto client = createLiteClient();
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-
-  // Create a new Target that just adds a new an app
-  auto new_target = createAppTarget({createApp("app-01")});
-
-  ON_CALL(*getAppEngine(), run).WillByDefault(Return(false));
-
-  // update to the latest version
-  // fetch retry for three times
-  EXPECT_CALL(*getAppEngine(), fetch).Times(1);
-  EXPECT_CALL(*getAppEngine(), isRunning).Times(0);
-  EXPECT_CALL(*getAppEngine(), install).Times(0);
-  EXPECT_CALL(*getAppEngine(), run).Times(1);
-
-  updateApps(*client, getInitialTarget(), new_target, data::ResultCode::Numeric::kOk,
-             data::ResultCode::Numeric::kInstallFailed);
-}
-
-TEST_F(LiteClientTest, OstreeAndAppUpdateIfRollback) {
-  // boot device
-  auto client = createLiteClient();
-  ASSERT_TRUE(targetsMatch(client->getCurrent(), getInitialTarget()));
-
-  // Create a new Target: update both rootfs and add new app
-  std::vector<AppEngine::App> apps{createApp("app-01")};
-  auto target_01 = createTarget(&apps);
-
-  {
-    EXPECT_CALL(*getAppEngine(), fetch).Times(1);
-
-    // since the Target/app is not installed then no reason to check if the app is running
-    EXPECT_CALL(*getAppEngine(), isRunning).Times(0);
-
-    // Just install no need too call run
-    EXPECT_CALL(*getAppEngine(), install).Times(1);
-    EXPECT_CALL(*getAppEngine(), run).Times(0);
-
-    // update to the latest version
-    update(*client, getInitialTarget(), target_01);
-  }
-
-  {
-    reboot(client);
-    ASSERT_TRUE(targetsMatch(client->getCurrent(), target_01));
-    checkHeaders(*client, target_01);
-  }
-
-  {
-    std::vector<AppEngine::App> apps{createApp("app-01", "test-factory", "new-hash")};
-    auto target_02 = createTarget(&apps);
-    // update to the latest version
-    update(*client, target_01, target_02);
-    // deploy the previous version/commit to emulate rollback
-    getSysRepo().deploy(target_01.sha256Hash());
-
-    reboot(client);
-    // make sure that a rollback has happened and a client is still running the previous Target
-    ASSERT_TRUE(targetsMatch(client->getCurrent(), target_01));
-    checkHeaders(*client, target_01);
   }
 }
 
