@@ -84,6 +84,7 @@ class LiteClient {
   std::pair<bool, Uptane::Target> downloadImage(const Uptane::Target& target,
                                                 const api::FlowControlToken* token = nullptr);
   static void add_apps_header(std::vector<std::string>& headers, PackageConfig& config);
+  data::InstallationResult finalizePendingUpdate(boost::optional<Uptane::Target>& target);
 
  private:
   boost::filesystem::path callback_program;
